@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 
 	"github.com/google/uuid"
 
@@ -79,6 +80,32 @@ func main() {
 		case path == "":
 			server.ListDocuments(w, r)
 			return
+		case strings.Contains(path, "/share/"):
+			// /api/documents/{id}/share/{token}
+			parts := strings.SplitN(path, "/share/", 2)
+			docID, token := parts[0], parts[1]
+			if r.Method == "DELETE" {
+				server.RevokeShare(w, r, docID, token)
+			} else {
+				http.Error(w, "method not allowed", 405)
+			}
+			return
+		case hasSuffix(path, "/share"):
+			docID := path[:len(path)-len("/share")]
+			if r.Method == "POST" {
+				server.CreateShare(w, r, docID)
+			} else {
+				http.Error(w, "method not allowed", 405)
+			}
+			return
+		case hasSuffix(path, "/shares"):
+			docID := path[:len(path)-len("/shares")]
+			if r.Method == "GET" {
+				server.ListShares(w, r, docID)
+			} else {
+				http.Error(w, "method not allowed", 405)
+			}
+			return
 		case hasSuffix(path, "/snapshot"):
 			docID := path[:len(path)-len("/snapshot")]
 			server.GetDocumentSnapshotByID(w, r, docID)
@@ -107,9 +134,24 @@ func main() {
 		}
 	})
 
+	// 只读分享访问（按token）
+	mux.HandleFunc("/api/shares/", func(w http.ResponseWriter, r *http.Request) {
+		token := r.URL.Path[len("/api/shares/"):]
+		if token == "" || r.Method != "GET" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		server.GetShareByToken(w, r, token)
+	})
+
 	// WebSocket路由
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		server.HandleWebSocket(w, r)
+	})
+
+	// 只读访客WebSocket路由
+	mux.HandleFunc("/ws/share", func(w http.ResponseWriter, r *http.Request) {
+		server.HandleShareWebSocket(w, r)
 	})
 
 	// 健康检查

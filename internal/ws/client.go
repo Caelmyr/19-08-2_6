@@ -133,10 +133,24 @@ func (c *Client) SendMessage(msg Message) error {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.closed {
+		return ErrConnectionClosed
+	}
 	select {
 	case c.Send <- data:
 		return nil
 	default:
 		return ErrSendBufferFull
+	}
+}
+
+// closeSend 关闭发送通道，由Hub在注销客户端时调用
+// 在mu保护下与SendMessage互斥，避免向已关闭通道发送导致panic
+func (c *Client) closeSend() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closed {
+		c.closed = true
+		close(c.Send)
 	}
 }

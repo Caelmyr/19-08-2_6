@@ -16,15 +16,16 @@ import (
 type MessageType string
 
 const (
-	MsgOp         MessageType = "op"         // 操作消息
-	MsgAck        MessageType = "ack"        // 操作确认
-	MsgCursors    MessageType = "cursors"    // 光标位置广播
-	MsgCursorMove MessageType = "cursor_move" // 光标移动
-	MsgUserJoin   MessageType = "user_join"  // 用户加入
-	MsgUserLeave  MessageType = "user_leave" // 用户离开
-	MsgInit       MessageType = "init"       // 初始化消息
-	MsgError      MessageType = "error"      // 错误消息
-	MsgSnapshot   MessageType = "snapshot"   // 快照请求
+	MsgOp           MessageType = "op"            // 操作消息
+	MsgAck          MessageType = "ack"           // 操作确认
+	MsgCursors      MessageType = "cursors"       // 光标位置广播
+	MsgCursorMove   MessageType = "cursor_move"   // 光标移动
+	MsgUserJoin     MessageType = "user_join"     // 用户加入
+	MsgUserLeave    MessageType = "user_leave"    // 用户离开
+	MsgInit         MessageType = "init"          // 初始化消息
+	MsgError        MessageType = "error"         // 错误消息
+	MsgSnapshot     MessageType = "snapshot"      // 快照请求
+	MsgShareRevoked MessageType = "share_revoked" // 分享链接被撤销或过期
 )
 
 // Message WebSocket消息
@@ -41,6 +42,8 @@ type Message struct {
 	Cursors   []Cursor    `json:"cursors,omitempty"`
 	Position  int         `json:"position,omitempty"`
 	Color     string      `json:"color,omitempty"`
+	ReadOnly  bool        `json:"read_only,omitempty"`
+	ExpiresAt *time.Time  `json:"expires_at,omitempty"`
 	Error     string      `json:"error,omitempty"`
 	Timestamp time.Time   `json:"timestamp,omitempty"`
 }
@@ -68,9 +71,14 @@ type Client struct {
 	Username string
 	Color    string
 	Position int
-	Conn     *websocket.Conn
-	Send     chan []byte
-	mu       sync.Mutex
+	// ReadOnly 为只读访客（通过分享链接接入）：不广播其加入/离开，
+	// 不出现在用户列表和光标列表，其上行消息全部被忽略
+	ReadOnly   bool
+	ShareToken string // 访客使用的分享链接token，撤销时按此断开
+	Conn       *websocket.Conn
+	Send       chan []byte
+	mu         sync.Mutex
+	closed     bool // Send通道是否已关闭（在mu保护下读写）
 }
 
 // Room 表示一个文档房间
@@ -161,7 +169,7 @@ func (h *Hub) removeClient(client *Client) {
 	room.mu.Lock()
 	if _, ok := room.Clients[client.ClientID]; ok {
 		delete(room.Clients, client.ClientID)
-		close(client.Send)
+		client.closeSend()
 	}
 	isEmpty := len(room.Clients) == 0
 	room.mu.Unlock()
@@ -172,8 +180,8 @@ func (h *Hub) removeClient(client *Client) {
 		delete(h.Rooms, client.RoomID)
 		h.mu.Unlock()
 		log.Printf("[Hub] Room %s empty, removed", client.RoomID)
-	} else {
-		// 通知其他用户
+	} else if !client.ReadOnly {
+		// 通知其他用户（只读访客对协作者不可见，无需广播）
 		h.broadcastUserLeave(room, client)
 		log.Printf("[Hub] Client %s left room %s (remaining: %d)", client.ClientID, client.RoomID, len(room.Clients))
 	}
@@ -244,7 +252,7 @@ func (h *Hub) BroadcastCursors(roomID string, senderID string, cursorMsg Message
 	}
 }
 
-// GetRoomUsers 获取房间内所有用户信息
+// GetRoomUsers 获取房间内所有用户信息（不含只读访客）
 func (h *Hub) GetRoomUsers(roomID string) []UserInfo {
 	h.mu.RLock()
 	room, exists := h.Rooms[roomID]
@@ -258,6 +266,9 @@ func (h *Hub) GetRoomUsers(roomID string) []UserInfo {
 
 	users := make([]UserInfo, 0, len(room.Clients))
 	for _, c := range room.Clients {
+		if c.ReadOnly {
+			continue
+		}
 		users = append(users, UserInfo{
 			ClientID: c.ClientID,
 			Username: c.Username,
@@ -267,7 +278,7 @@ func (h *Hub) GetRoomUsers(roomID string) []UserInfo {
 	return users
 }
 
-// GetRoomCursors 获取房间内所有光标位置
+// GetRoomCursors 获取房间内所有光标位置（不含只读访客）
 func (h *Hub) GetRoomCursors(roomID string) []Cursor {
 	h.mu.RLock()
 	room, exists := h.Rooms[roomID]
@@ -281,6 +292,9 @@ func (h *Hub) GetRoomCursors(roomID string) []Cursor {
 
 	cursors := make([]Cursor, 0, len(room.Clients))
 	for _, c := range room.Clients {
+		if c.ReadOnly {
+			continue
+		}
 		cursors = append(cursors, Cursor{
 			ClientID: c.ClientID,
 			Username: c.Username,
@@ -289,6 +303,37 @@ func (h *Hub) GetRoomCursors(roomID string) []Cursor {
 		})
 	}
 	return cursors
+}
+
+// DisconnectViewers 断开房间内使用指定分享token的所有只读访客连接
+// 用于分享链接被撤销或过期时，让正在观看的访客立刻失去访问
+// 返回断开的连接数
+func (h *Hub) DisconnectViewers(roomID, shareToken string, finalMsg Message) int {
+	h.mu.RLock()
+	room, exists := h.Rooms[roomID]
+	h.mu.RUnlock()
+	if !exists {
+		return 0
+	}
+
+	// 先收集目标客户端，避免持锁期间做通道操作
+	room.mu.RLock()
+	targets := make([]*Client, 0)
+	for _, c := range room.Clients {
+		if c.ReadOnly && c.ShareToken == shareToken {
+			targets = append(targets, c)
+		}
+	}
+	room.mu.RUnlock()
+
+	for _, c := range targets {
+		// 先推送最后一条消息告知原因，再注销（注销会关闭Send通道，
+		// WritePump排空缓冲后向对端发送close帧）
+		c.SendMessage(finalMsg)
+		h.Unregister <- c
+		log.Printf("[Hub] Viewer %s disconnected from room %s (share token revoked/expired)", c.ClientID, roomID)
+	}
+	return len(targets)
 }
 
 // IsRoomEmpty 检查房间是否为空

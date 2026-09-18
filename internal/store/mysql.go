@@ -62,6 +62,26 @@ type OperationRecord struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+// ShareLink 只读分享链接
+type ShareLink struct {
+	Token     string     `json:"token"`
+	DocID     string     `json:"doc_id"`
+	ExpiresAt *time.Time `json:"expires_at"` // nil 表示永不过期
+	Revoked   bool       `json:"revoked"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+// Valid 判断分享链接当前是否可用（未撤销且未过期）
+func (l *ShareLink) Valid() bool {
+	if l == nil || l.Revoked {
+		return false
+	}
+	if l.ExpiresAt != nil && !time.Now().Before(*l.ExpiresAt) {
+		return false
+	}
+	return true
+}
+
 // Store 存储接口
 type Store struct {
 	db *sql.DB
@@ -232,4 +252,80 @@ func (s *Store) SaveSnapshotTransaction(docID, content string, version int64) er
 	}
 
 	return tx.Commit()
+}
+
+// ============================================================
+// 只读分享链接
+// ============================================================
+
+// CreateShareLink 创建分享链接，expiresAt 为 nil 表示永不过期
+func (s *Store) CreateShareLink(token, docID string, expiresAt *time.Time) error {
+	_, err := s.db.Exec(
+		"INSERT INTO share_links (token, doc_id, expires_at) VALUES (?, ?, ?)",
+		token, docID, expiresAt,
+	)
+	return err
+}
+
+// GetShareLink 按token查询分享链接，不存在返回 nil, nil
+func (s *Store) GetShareLink(token string) (*ShareLink, error) {
+	var link ShareLink
+	var expiresAt sql.NullTime
+	err := s.db.QueryRow(
+		"SELECT token, doc_id, expires_at, revoked, created_at FROM share_links WHERE token = ?",
+		token,
+	).Scan(&link.Token, &link.DocID, &expiresAt, &link.Revoked, &link.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get share link: %w", err)
+	}
+	if expiresAt.Valid {
+		t := expiresAt.Time
+		link.ExpiresAt = &t
+	}
+	return &link, nil
+}
+
+// ListShareLinks 列出文档当前有效的分享链接（未撤销且未过期）
+func (s *Store) ListShareLinks(docID string) ([]ShareLink, error) {
+	rows, err := s.db.Query(
+		"SELECT token, doc_id, expires_at, revoked, created_at FROM share_links "+
+			"WHERE doc_id = ? AND revoked = 0 AND (expires_at IS NULL OR expires_at > NOW()) "+
+			"ORDER BY created_at DESC",
+		docID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list share links: %w", err)
+	}
+	defer rows.Close()
+
+	var links []ShareLink
+	for rows.Next() {
+		var link ShareLink
+		var expiresAt sql.NullTime
+		if err := rows.Scan(&link.Token, &link.DocID, &expiresAt, &link.Revoked, &link.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan share link: %w", err)
+		}
+		if expiresAt.Valid {
+			t := expiresAt.Time
+			link.ExpiresAt = &t
+		}
+		links = append(links, link)
+	}
+	return links, rows.Err()
+}
+
+// RevokeShareLink 撤销分享链接，返回是否撤销成功（链接存在且此前未撤销）
+func (s *Store) RevokeShareLink(token string) (bool, error) {
+	res, err := s.db.Exec("UPDATE share_links SET revoked = 1 WHERE token = ? AND revoked = 0", token)
+	if err != nil {
+		return false, err
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return affected > 0, nil
 }

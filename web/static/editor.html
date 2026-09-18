@@ -151,6 +151,119 @@
     align-items: center;
     gap: 6px;
   }
+
+  .share-btn {
+    padding: 6px 14px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    background: #4361ee;
+    color: white;
+    transition: background 0.2s;
+  }
+  .share-btn:hover { background: #3a56d4; }
+
+  /* 分享弹窗 */
+  .modal-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(26, 26, 46, 0.45);
+    display: none;
+    align-items: center;
+    justify-content: center;
+    z-index: 100;
+  }
+  .modal-overlay.show { display: flex; }
+  .modal {
+    background: white;
+    border-radius: 12px;
+    padding: 24px;
+    width: 520px;
+    max-width: 92vw;
+    max-height: 80vh;
+    overflow-y: auto;
+    box-shadow: 0 8px 32px rgba(0,0,0,0.2);
+  }
+  .modal h2 { font-size: 18px; color: #1a1a2e; margin-bottom: 4px; }
+  .modal .modal-sub { font-size: 13px; color: #888; margin-bottom: 16px; }
+  .share-create-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 20px;
+  }
+  .share-create-row select {
+    padding: 8px 10px;
+    border: 2px solid #e8ecf1;
+    border-radius: 8px;
+    font-size: 13px;
+    background: white;
+  }
+  .share-create-row button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    background: #4361ee;
+    color: white;
+    white-space: nowrap;
+  }
+  .share-create-row button:hover { background: #3a56d4; }
+  .share-list-title {
+    font-size: 13px;
+    color: #666;
+    margin-bottom: 8px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .share-item {
+    border: 1px solid #e8ecf1;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+  }
+  .share-item-url {
+    font-size: 12px;
+    color: #4361ee;
+    word-break: break-all;
+    margin-bottom: 6px;
+    font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+  }
+  .share-item-meta {
+    font-size: 12px;
+    color: #999;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .share-item-actions { display: flex; gap: 6px; }
+  .share-item-actions button {
+    padding: 4px 10px;
+    border: none;
+    border-radius: 6px;
+    cursor: pointer;
+    font-size: 12px;
+  }
+  .copy-btn { background: #e8ecf1; color: #333; }
+  .copy-btn:hover { background: #d8dde3; }
+  .revoke-btn { background: #fdecea; color: #c0392b; }
+  .revoke-btn:hover { background: #fbdcd8; }
+  .share-empty { font-size: 13px; color: #aaa; padding: 8px 0 16px; }
+  .modal-close-row { display: flex; justify-content: flex-end; margin-top: 16px; }
+  .modal-close-row button {
+    padding: 8px 20px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    background: #e8ecf1;
+    color: #333;
+  }
+  .modal-close-row button:hover { background: #d8dde3; }
 </style>
 </head>
 <body>
@@ -161,9 +274,32 @@
     <div class="doc-title" id="docTitle">加载中...</div>
   </div>
   <div class="toolbar-right">
+    <button class="share-btn" id="shareBtn">🔗 分享</button>
     <div class="version-badge">v<span id="version">0</span></div>
     <div class="status-indicator" id="status"></div>
     <span id="statusText">连接中...</span>
+  </div>
+</div>
+
+<!-- 分享管理弹窗 -->
+<div class="modal-overlay" id="shareModal">
+  <div class="modal">
+    <h2>🔗 只读分享</h2>
+    <p class="modal-sub">访客通过链接实时查看文档内容和协作者光标，但无法编辑。链接可随时撤销或设置有效期。</p>
+    <div class="share-create-row">
+      <select id="expirySelect">
+        <option value="0">永不过期</option>
+        <option value="3600">1 小时后过期</option>
+        <option value="86400">1 天后过期</option>
+        <option value="604800">7 天后过期</option>
+      </select>
+      <button onclick="createShare()">创建分享链接</button>
+    </div>
+    <div class="share-list-title">有效链接</div>
+    <div id="shareList"></div>
+    <div class="modal-close-row">
+      <button onclick="closeShareModal()">关闭</button>
+    </div>
   </div>
 </div>
 
@@ -649,6 +785,107 @@ function escapeHtml(s) {
   const div = document.createElement('div');
   div.textContent = s;
   return div.innerHTML;
+}
+
+// ========== 只读分享管理 ==========
+const shareModal = document.getElementById('shareModal');
+const shareList = document.getElementById('shareList');
+
+document.getElementById('shareBtn').addEventListener('click', () => {
+  shareModal.classList.add('show');
+  loadShares();
+});
+shareModal.addEventListener('click', (e) => {
+  if (e.target === shareModal) closeShareModal();
+});
+
+function closeShareModal() {
+  shareModal.classList.remove('show');
+}
+
+function shareUrl(token) {
+  return `${location.origin}/share.html?token=${token}`;
+}
+
+async function createShare() {
+  const expiresIn = parseInt(document.getElementById('expirySelect').value, 10);
+  try {
+    const res = await fetch(`/api/documents/${docId}/share`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ expires_in_seconds: expiresIn })
+    });
+    if (!res.ok) {
+      alert('创建分享链接失败: ' + (await res.text()));
+      return;
+    }
+    const data = await res.json();
+    loadShares();
+    // 创建成功后直接复制到剪贴板
+    copyText(shareUrl(data.token), '链接已创建并复制到剪贴板');
+  } catch (e) {
+    alert('创建分享链接失败: ' + e);
+  }
+}
+
+async function loadShares() {
+  try {
+    const res = await fetch(`/api/documents/${docId}/shares`);
+    const links = await res.json();
+    renderShares(links || []);
+  } catch (e) {
+    console.error('加载分享链接失败:', e);
+  }
+}
+
+function renderShares(links) {
+  if (links.length === 0) {
+    shareList.innerHTML = '<div class="share-empty">暂无有效链接，点击上方按钮创建。</div>';
+    return;
+  }
+  shareList.innerHTML = links.map(l => `
+    <div class="share-item">
+      <div class="share-item-url">${escapeHtml(shareUrl(l.token))}</div>
+      <div class="share-item-meta">
+        <span>${l.expires_at ? '⏳ ' + new Date(l.expires_at).toLocaleString('zh-CN') + ' 过期' : '∞ 永不过期'}</span>
+        <span class="share-item-actions">
+          <button class="copy-btn" onclick="copyText('${shareUrl(l.token)}', '已复制')">复制</button>
+          <button class="revoke-btn" onclick="revokeShare('${l.token}')">撤销</button>
+        </span>
+      </div>
+    </div>
+  `).join('');
+}
+
+async function revokeShare(token) {
+  if (!confirm('撤销后，正在通过该链接查看的访客将立刻失去访问。确定撤销？')) return;
+  try {
+    const res = await fetch(`/api/documents/${docId}/share/${token}`, { method: 'DELETE' });
+    if (!res.ok) {
+      alert('撤销失败: ' + (await res.text()));
+      return;
+    }
+    loadShares();
+  } catch (e) {
+    alert('撤销失败: ' + e);
+  }
+}
+
+function copyText(text, tip) {
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(text).then(() => alert(tip)).catch(() => fallbackCopy(text, tip));
+  } else {
+    fallbackCopy(text, tip);
+  }
+}
+
+function fallbackCopy(text, tip) {
+  const ta = document.createElement('textarea');
+  ta.value = text;
+  document.body.appendChild(ta);
+  ta.select();
+  try { document.execCommand('copy'); alert(tip); } catch (e) { prompt('请手动复制链接:', text); }
+  document.body.removeChild(ta);
 }
 
 // 启动
