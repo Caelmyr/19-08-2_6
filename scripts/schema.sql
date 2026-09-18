@@ -3,6 +3,7 @@ CREATE DATABASE IF NOT EXISTS coedit DEFAULT CHARSET utf8mb4 COLLATE utf8mb4_uni
 USE coedit;
 
 -- 文档表：存储文档当前快照和版本信息
+DROP TABLE IF EXISTS share_links;
 DROP TABLE IF EXISTS operations;
 DROP TABLE IF EXISTS documents;
 
@@ -31,3 +32,14 @@ CREATE TABLE operations (
     INDEX idx_doc_client (doc_id, client_id),
     FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='操作日志表';
+
+-- 只读分享链接表
+CREATE TABLE share_links (
+    token VARCHAR(64) PRIMARY KEY COMMENT '分享令牌(URL携带)',
+    doc_id VARCHAR(36) NOT NULL COMMENT '文档ID',
+    expires_at DATETIME NULL COMMENT '过期时间，NULL=永不过期',
+    revoked TINYINT(1) NOT NULL DEFAULT 0 COMMENT '是否已撤销',
+    created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    INDEX idx_doc (doc_id),
+    FOREIGN KEY (doc_id) REFERENCES documents(id) ON DELETE CASCADE
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COMMENT='只读分享链接表';

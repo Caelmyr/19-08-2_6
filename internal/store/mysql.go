@@ -233,3 +233,83 @@ func (s *Store) SaveSnapshotTransaction(docID, content string, version int64) er
 
 	return tx.Commit()
 }
+
+// ============================================================
+// 只读分享链接
+// ============================================================
+
+// ShareLink 只读分享链接
+type ShareLink struct {
+	Token     string     `json:"token"`
+	DocID     string     `json:"doc_id"`
+	ExpiresAt *time.Time `json:"expires_at"` // nil 表示永不过期
+	Revoked   bool       `json:"revoked"`
+	CreatedAt time.Time  `json:"created_at"`
+}
+
+// IsValid 链接当前是否可用：未撤销且未过期
+func (l *ShareLink) IsValid() bool {
+	if l == nil || l.Revoked {
+		return false
+	}
+	if l.ExpiresAt != nil && !l.ExpiresAt.After(time.Now()) {
+		return false
+	}
+	return true
+}
+
+// CreateShareLink 创建只读分享链接，expiresAt 为 nil 表示永不过期
+func (s *Store) CreateShareLink(token, docID string, expiresAt *time.Time) (*ShareLink, error) {
+	_, err := s.db.Exec(
+		"INSERT INTO share_links (token, doc_id, expires_at) VALUES (?, ?, ?)",
+		token, docID, expiresAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("create share link: %w", err)
+	}
+	return s.GetShareLink(token)
+}
+
+// GetShareLink 按token查询分享链接
+func (s *Store) GetShareLink(token string) (*ShareLink, error) {
+	var l ShareLink
+	err := s.db.QueryRow(
+		"SELECT token, doc_id, expires_at, revoked, created_at FROM share_links WHERE token = ?",
+		token,
+	).Scan(&l.Token, &l.DocID, &l.ExpiresAt, &l.Revoked, &l.CreatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("get share link: %w", err)
+	}
+	return &l, nil
+}
+
+// RevokeShareLink 撤销分享链接（幂等）
+func (s *Store) RevokeShareLink(token string) error {
+	_, err := s.db.Exec("UPDATE share_links SET revoked = 1 WHERE token = ?", token)
+	return err
+}
+
+// ListShareLinks 列出文档的所有分享链接
+func (s *Store) ListShareLinks(docID string) ([]ShareLink, error) {
+	rows, err := s.db.Query(
+		"SELECT token, doc_id, expires_at, revoked, created_at FROM share_links WHERE doc_id = ? ORDER BY created_at DESC",
+		docID,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("list share links: %w", err)
+	}
+	defer rows.Close()
+
+	var links []ShareLink
+	for rows.Next() {
+		var l ShareLink
+		if err := rows.Scan(&l.Token, &l.DocID, &l.ExpiresAt, &l.Revoked, &l.CreatedAt); err != nil {
+			return nil, fmt.Errorf("scan share link: %w", err)
+		}
+		links = append(links, l)
+	}
+	return links, rows.Err()
+}

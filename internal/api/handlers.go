@@ -36,6 +36,7 @@ type Server struct {
 // DocState 文档的运行时状态
 type DocState struct {
 	ID        string
+	Title     string
 	Content   string
 	Version   int64
 	Ops       []ot.Operation // 版本号从1开始，ops[0]对应version=1
@@ -77,6 +78,7 @@ func (s *Server) getOrLoadDocState(docID string) (*DocState, error) {
 
 	state = &DocState{
 		ID:      docID,
+		Title:   doc.Title,
 		Content: doc.ContentSnapshot,
 		Version: doc.CurrentVersion,
 		Ops:     nil,
@@ -448,6 +450,107 @@ func (s *Server) DeleteDocument(w http.ResponseWriter, r *http.Request) {
 }
 
 // ============================================================
+// 只读分享链接 API
+// ============================================================
+
+// CreateShareLink 创建只读分享链接
+// POST /api/documents/{id}/share  body: {"expires_in_seconds": 3600}（0或缺省=永不过期）
+func (s *Server) CreateShareLink(w http.ResponseWriter, r *http.Request, docID string) {
+	doc, err := s.Store.GetDocument(docID)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if doc == nil {
+		http.Error(w, "document not found", 404)
+		return
+	}
+
+	var req struct {
+		ExpiresInSeconds int64 `json:"expires_in_seconds"`
+	}
+	if r.Header.Get("Content-Type") == "application/json" {
+		json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	var expiresAt *time.Time
+	if req.ExpiresInSeconds > 0 {
+		t := time.Now().Add(time.Duration(req.ExpiresInSeconds) * time.Second)
+		expiresAt = &t
+	}
+
+	token := uuid.New().String()
+	link, err := s.Store.CreateShareLink(token, docID, expiresAt)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	writeJSON(w, 200, map[string]interface{}{
+		"token":      link.Token,
+		"share_url":  "/share/" + link.Token,
+		"doc_id":     link.DocID,
+		"expires_at": link.ExpiresAt,
+		"created_at": link.CreatedAt,
+	})
+}
+
+// RevokeShareLink 撤销分享链接，正在观看的访客会被立即断开
+// DELETE /api/share/{token}
+func (s *Server) RevokeShareLink(w http.ResponseWriter, r *http.Request, token string) {
+	link, err := s.Store.GetShareLink(token)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if link == nil {
+		http.Error(w, "share link not found", 404)
+		return
+	}
+
+	if err := s.Store.RevokeShareLink(token); err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+
+	// 立即断开所有通过该链接观看的访客
+	kicked := s.Hub.KickShareViewers(token, ws.MsgShareRevoked, "分享链接已被撤销")
+	log.Printf("[Share] Link %s revoked, kicked %d viewers", token, kicked)
+
+	writeJSON(w, 200, map[string]interface{}{
+		"status":        "revoked",
+		"kicked_viewer": kicked,
+	})
+}
+
+// ListShareLinks 列出文档的所有分享链接
+// GET /api/documents/{id}/shares
+func (s *Server) ListShareLinks(w http.ResponseWriter, r *http.Request, docID string) {
+	links, err := s.Store.ListShareLinks(docID)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if links == nil {
+		links = []store.ShareLink{}
+	}
+	writeJSON(w, 200, links)
+}
+
+// StartShareExpiryJanitor 启动过期访客清理协程
+// 周期检查所有在线访客，链接一到期立即断开
+func (s *Server) StartShareExpiryJanitor() {
+	ticker := time.NewTicker(time.Second)
+	go func() {
+		for range ticker.C {
+			if n := s.Hub.KickExpiredViewers(time.Now()); n > 0 {
+				log.Printf("[Share] Kicked %d viewers with expired links", n)
+			}
+		}
+	}()
+}
+
+// ============================================================
 // WebSocket 处理
 // ============================================================
 
@@ -456,6 +559,14 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	// 从URL参数获取doc_id和username
 	docID := r.URL.Query().Get("doc_id")
 	username := r.URL.Query().Get("username")
+	shareToken := r.URL.Query().Get("share_token")
+
+	// 只读访客通道：凭分享token进入
+	if shareToken != "" {
+		s.handleViewerWebSocket(w, r, shareToken)
+		return
+	}
+
 	if username == "" {
 		username = "User-" + uuid.New().String()[:4]
 	}
@@ -491,6 +602,45 @@ func (s *Server) HandleWebSocket(w http.ResponseWriter, r *http.Request) {
 	go client.ReadPump(s.handleMessage)
 }
 
+// handleViewerWebSocket 处理只读访客的WebSocket连接
+// 访客只能接收文档内容和协作者光标，任何上行消息都会被服务端丢弃
+func (s *Server) handleViewerWebSocket(w http.ResponseWriter, r *http.Request, shareToken string) {
+	link, err := s.Store.GetShareLink(shareToken)
+	if err != nil {
+		http.Error(w, err.Error(), 500)
+		return
+	}
+	if link == nil || !link.IsValid() {
+		http.Error(w, "share link invalid or expired", 403)
+		return
+	}
+
+	// 确保文档存在
+	if _, err := s.getOrLoadDocState(link.DocID); err != nil {
+		http.Error(w, "document not found", 404)
+		return
+	}
+
+	conn, err := s.upgrader.Upgrade(w, r, nil)
+	if err != nil {
+		log.Printf("[WS] Upgrade error: %v", err)
+		return
+	}
+
+	username := "访客-" + uuid.New().String()[:4]
+	client := ws.NewViewerClient(s.Hub, conn, link.DocID, username, shareToken, link.ExpiresAt)
+
+	// 注册到Hub
+	s.Hub.Register <- client
+
+	// 发送初始化消息
+	s.sendInitMessage(client)
+
+	// 启动读写循环
+	go client.WritePump()
+	go client.ReadPump(s.handleMessage)
+}
+
 // sendInitMessage 发送初始化消息给新连接的客户端
 func (s *Server) sendInitMessage(client *ws.Client) {
 	state, err := s.getOrLoadDocState(client.RoomID)
@@ -504,6 +654,7 @@ func (s *Server) sendInitMessage(client *ws.Client) {
 		DocID:    client.RoomID,
 		ClientID: client.ClientID,
 		Username: client.Username,
+		Title:    state.Title,
 		Content:  state.Content,
 		Version:  state.Version,
 		Users:    s.Hub.GetRoomUsers(client.RoomID),
@@ -514,7 +665,10 @@ func (s *Server) sendInitMessage(client *ws.Client) {
 
 	client.SendMessage(msg)
 
-	// 通知其他用户有新用户加入
+	// 通知其他用户有新用户加入（只读访客对协作者不可见，不广播）
+	if client.ReadOnly {
+		return
+	}
 	s.Hub.BroadcastOp(client.RoomID, client.ClientID, ws.Message{
 		Type:     ws.MsgUserJoin,
 		DocID:    client.RoomID,
@@ -526,6 +680,12 @@ func (s *Server) sendInitMessage(client *ws.Client) {
 
 // handleMessage 处理来自客户端的WebSocket消息
 func (s *Server) handleMessage(client *ws.Client, msg ws.Message) {
+	// 只读访客的一切上行消息直接丢弃：
+	// 访客浏览不允许对文档内容、版本或任何数据产生改动
+	if client.ReadOnly {
+		return
+	}
+
 	switch msg.Type {
 	case ws.MsgCursorMove:
 		// 更新光标位置并广播

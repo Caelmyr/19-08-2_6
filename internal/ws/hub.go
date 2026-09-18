@@ -16,15 +16,17 @@ import (
 type MessageType string
 
 const (
-	MsgOp         MessageType = "op"         // 操作消息
-	MsgAck        MessageType = "ack"        // 操作确认
-	MsgCursors    MessageType = "cursors"    // 光标位置广播
-	MsgCursorMove MessageType = "cursor_move" // 光标移动
-	MsgUserJoin   MessageType = "user_join"  // 用户加入
-	MsgUserLeave  MessageType = "user_leave" // 用户离开
-	MsgInit       MessageType = "init"       // 初始化消息
-	MsgError      MessageType = "error"      // 错误消息
-	MsgSnapshot   MessageType = "snapshot"   // 快照请求
+	MsgOp           MessageType = "op"            // 操作消息
+	MsgAck          MessageType = "ack"           // 操作确认
+	MsgCursors      MessageType = "cursors"       // 光标位置广播
+	MsgCursorMove   MessageType = "cursor_move"   // 光标移动
+	MsgUserJoin     MessageType = "user_join"     // 用户加入
+	MsgUserLeave    MessageType = "user_leave"    // 用户离开
+	MsgInit         MessageType = "init"          // 初始化消息
+	MsgError        MessageType = "error"         // 错误消息
+	MsgSnapshot     MessageType = "snapshot"      // 快照请求
+	MsgShareRevoked MessageType = "share_revoked" // 分享链接已撤销
+	MsgShareExpired MessageType = "share_expired" // 分享链接已过期
 )
 
 // Message WebSocket消息
@@ -33,6 +35,7 @@ type Message struct {
 	DocID     string      `json:"doc_id,omitempty"`
 	ClientID  string      `json:"client_id,omitempty"`
 	Username  string      `json:"username,omitempty"`
+	Title     string      `json:"title,omitempty"`
 	Version   int64       `json:"version,omitempty"`
 	BaseVer   int64       `json:"base_version,omitempty"`
 	Op        interface{} `json:"op,omitempty"`
@@ -71,6 +74,11 @@ type Client struct {
 	Conn     *websocket.Conn
 	Send     chan []byte
 	mu       sync.Mutex
+
+	// 只读访客（通过分享链接进入）
+	ReadOnly       bool
+	ShareToken     string
+	ShareExpiresAt *time.Time // nil 表示永不过期
 }
 
 // Room 表示一个文档房间
@@ -172,8 +180,8 @@ func (h *Hub) removeClient(client *Client) {
 		delete(h.Rooms, client.RoomID)
 		h.mu.Unlock()
 		log.Printf("[Hub] Room %s empty, removed", client.RoomID)
-	} else {
-		// 通知其他用户
+	} else if !client.ReadOnly {
+		// 通知其他用户（只读访客对协作者不可见，不广播离开）
 		h.broadcastUserLeave(room, client)
 		log.Printf("[Hub] Client %s left room %s (remaining: %d)", client.ClientID, client.RoomID, len(room.Clients))
 	}
@@ -244,7 +252,7 @@ func (h *Hub) BroadcastCursors(roomID string, senderID string, cursorMsg Message
 	}
 }
 
-// GetRoomUsers 获取房间内所有用户信息
+// GetRoomUsers 获取房间内所有用户信息（不含只读访客）
 func (h *Hub) GetRoomUsers(roomID string) []UserInfo {
 	h.mu.RLock()
 	room, exists := h.Rooms[roomID]
@@ -258,6 +266,9 @@ func (h *Hub) GetRoomUsers(roomID string) []UserInfo {
 
 	users := make([]UserInfo, 0, len(room.Clients))
 	for _, c := range room.Clients {
+		if c.ReadOnly {
+			continue
+		}
 		users = append(users, UserInfo{
 			ClientID: c.ClientID,
 			Username: c.Username,
@@ -267,7 +278,7 @@ func (h *Hub) GetRoomUsers(roomID string) []UserInfo {
 	return users
 }
 
-// GetRoomCursors 获取房间内所有光标位置
+// GetRoomCursors 获取房间内所有光标位置（不含只读访客）
 func (h *Hub) GetRoomCursors(roomID string) []Cursor {
 	h.mu.RLock()
 	room, exists := h.Rooms[roomID]
@@ -281,6 +292,9 @@ func (h *Hub) GetRoomCursors(roomID string) []Cursor {
 
 	cursors := make([]Cursor, 0, len(room.Clients))
 	for _, c := range room.Clients {
+		if c.ReadOnly {
+			continue
+		}
 		cursors = append(cursors, Cursor{
 			ClientID: c.ClientID,
 			Username: c.Username,
@@ -302,4 +316,59 @@ func (h *Hub) IsRoomEmpty(roomID string) bool {
 	room.mu.RLock()
 	defer room.mu.RUnlock()
 	return len(room.Clients) == 0
+}
+
+// KickShareViewers 断开指定分享链接的所有访客连接（用于撤销链接）
+// 先推送通知消息，短暂延迟后关闭连接，确保消息送达
+func (h *Hub) KickShareViewers(token string, msgType MessageType, reason string) int {
+	clients := h.findViewers(func(c *Client) bool {
+		return c.ReadOnly && c.ShareToken == token
+	})
+	for _, c := range clients {
+		kickViewer(c, msgType, reason)
+	}
+	return len(clients)
+}
+
+// KickExpiredViewers 断开所有已过期的访客连接，返回断开数量
+func (h *Hub) KickExpiredViewers(now time.Time) int {
+	clients := h.findViewers(func(c *Client) bool {
+		return c.ReadOnly && c.ShareExpiresAt != nil && !c.ShareExpiresAt.After(now)
+	})
+	for _, c := range clients {
+		kickViewer(c, MsgShareExpired, "分享链接已过期")
+	}
+	return len(clients)
+}
+
+// findViewers 查找满足条件的访客连接
+func (h *Hub) findViewers(match func(*Client) bool) []*Client {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+
+	var clients []*Client
+	for _, room := range h.Rooms {
+		room.mu.RLock()
+		for _, c := range room.Clients {
+			if match(c) {
+				clients = append(clients, c)
+			}
+		}
+		room.mu.RUnlock()
+	}
+	return clients
+}
+
+// kickViewer 通知访客链接失效并关闭其连接
+func kickViewer(c *Client, msgType MessageType, reason string) {
+	_ = c.SendMessage(Message{
+		Type:     msgType,
+		DocID:    c.RoomID,
+		ClientID: c.ClientID,
+		Error:    reason,
+	})
+	// 留出时间让 WritePump 把通知发出去，再关闭连接触发清理
+	time.AfterFunc(200*time.Millisecond, func() {
+		c.Conn.Close()
+	})
 }

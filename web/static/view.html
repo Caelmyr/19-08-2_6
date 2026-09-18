@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>CoEdit - 只读视图</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+    background: #f5f7fa;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+  }
+
+  .toolbar {
+    background: white;
+    padding: 12px 24px;
+    border-bottom: 1px solid #e8ecf1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+  }
+  .toolbar-left { display: flex; align-items: center; gap: 16px; }
+  .toolbar-right { display: flex; align-items: center; gap: 12px; }
+  .doc-title {
+    font-size: 18px;
+    font-weight: 600;
+    color: #1a1a2e;
+  }
+  .readonly-badge {
+    background: #fff3cd;
+    color: #856404;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    font-weight: 500;
+  }
+  .version-badge {
+    background: #e8ecf1;
+    padding: 4px 10px;
+    border-radius: 12px;
+    font-size: 12px;
+    color: #666;
+  }
+  .status-indicator {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #999;
+    display: inline-block;
+    margin-right: 6px;
+  }
+  .status-indicator.connected { background: #2ecc71; }
+  .status-indicator.disconnected { background: #e74c3c; }
+
+  .editor-wrapper {
+    flex: 1;
+    display: flex;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .cursors-layer {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+  }
+  .remote-cursor {
+    position: absolute;
+    width: 2px;
+    transition: top 0.15s, left 0.15s;
+    z-index: 10;
+  }
+  .remote-cursor-label {
+    position: absolute;
+    top: -18px;
+    left: -1px;
+    font-size: 11px;
+    padding: 2px 6px;
+    border-radius: 3px;
+    color: white;
+    white-space: nowrap;
+  }
+
+  #editor {
+    width: 100%;
+    height: 100%;
+    padding: 32px 64px;
+    font-size: 16px;
+    line-height: 1.7;
+    border: none;
+    outline: none;
+    resize: none;
+    font-family: 'SF Mono', 'Monaco', 'Consolas', monospace;
+    background: white;
+    cursor: default;
+  }
+
+  .sidebar {
+    width: 240px;
+    background: white;
+    border-left: 1px solid #e8ecf1;
+    padding: 16px;
+    overflow-y: auto;
+  }
+  .sidebar h3 {
+    font-size: 14px;
+    color: #666;
+    margin-bottom: 12px;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+  }
+  .sidebar p {
+    font-size: 12px;
+    color: #999;
+    line-height: 1.6;
+    margin-bottom: 8px;
+  }
+
+  .user-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding: 4px 10px;
+    border-radius: 16px;
+    font-size: 12px;
+    background: white;
+    border: 2px solid;
+    margin: 0 8px 8px 0;
+  }
+  .user-chip .dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+  }
+
+  .footer-bar {
+    background: white;
+    padding: 8px 24px;
+    border-top: 1px solid #e8ecf1;
+    font-size: 12px;
+    color: #999;
+    display: flex;
+    justify-content: space-between;
+  }
+
+  /* 链接失效遮罩 */
+  .overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(26, 26, 46, 0.75);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .overlay.show { display: flex; }
+  .overlay-card {
+    background: white;
+    border-radius: 12px;
+    padding: 40px 48px;
+    text-align: center;
+    max-width: 400px;
+  }
+  .overlay-icon { font-size: 48px; margin-bottom: 16px; }
+  .overlay-title {
+    font-size: 20px;
+    font-weight: 600;
+    color: #1a1a2e;
+    margin-bottom: 8px;
+  }
+  .overlay-desc { font-size: 14px; color: #666; }
+</style>
+</head>
+<body>
+
+<div class="toolbar">
+  <div class="toolbar-left">
+    <div class="doc-title" id="docTitle">加载中...</div>
+    <span class="readonly-badge">👁 只读</span>
+  </div>
+  <div class="toolbar-right">
+    <div class="version-badge">v<span id="version">0</span></div>
+    <div class="status-indicator" id="status"></div>
+    <span id="statusText">连接中...</span>
+  </div>
+</div>
+
+<div class="editor-wrapper">
+  <div class="cursors-layer" id="cursorsLayer"></div>
+  <textarea id="editor" spellcheck="false" readonly placeholder="文档内容加载中..."></textarea>
+  <div class="sidebar">
+    <h3>正在编辑的人</h3>
+    <div id="usersPanel"></div>
+    <h3 style="margin-top:24px;">说明</h3>
+    <p>👁 你正在通过只读链接查看此文档</p>
+    <p>🎨 彩色光标是正在编辑的协作者</p>
+    <p>⚡ 内容实时同步，无需刷新</p>
+  </div>
+</div>
+
+<div class="footer-bar">
+  <div>👥 正在编辑: <span id="userCount">0</span> 人</div>
+  <div>CoEdit 只读分享视图</div>
+</div>
+
+<div class="overlay" id="overlay">
+  <div class="overlay-card">
+    <div class="overlay-icon" id="overlayIcon">🔒</div>
+    <div class="overlay-title" id="overlayTitle">链接已失效</div>
+    <div class="overlay-desc" id="overlayDesc">该分享链接已被撤销或已过期</div>
+  </div>
+</div>
+
+<script>
+// ========== 状态管理 ==========
+// token 来自 URL 路径: /share/{token}
+const pathParts = window.location.pathname.split('/');
+const shareToken = pathParts[pathParts.length - 1];
+
+let state = {
+  content: '',
+  version: 0,
+  clientId: null,
+  remoteCursors: {},
+  users: [],
+  ws: null,
+  initialized: false,   // 是否收到过 init（用于区分"链接无效"和"断线"）
+  terminated: false,    // 是否被服务端终止（撤销/过期），终止后不再重连
+};
+
+const editor = document.getElementById('editor');
+const cursorsLayer = document.getElementById('cursorsLayer');
+const versionEl = document.getElementById('version');
+const statusEl = document.getElementById('status');
+const statusText = document.getElementById('statusText');
+const usersPanel = document.getElementById('usersPanel');
+const userCount = document.getElementById('userCount');
+const docTitle = document.getElementById('docTitle');
+const overlay = document.getElementById('overlay');
+
+// ========== 初始化 ==========
+function init() {
+  if (!shareToken) {
+    showOverlay('🔒', '链接无效', '缺少分享令牌');
+    return;
+  }
+  connectWS();
+  // 只读视图：不监听任何编辑事件，只跟随滚动重绘光标
+  editor.addEventListener('scroll', renderCursors);
+  window.addEventListener('resize', renderCursors);
+}
+
+// ========== WebSocket ==========
+function connectWS() {
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const url = `${proto}//${location.host}/ws?share_token=${encodeURIComponent(shareToken)}`;
+
+  state.ws = new WebSocket(url);
+
+  state.ws.onopen = () => {
+    statusEl.className = 'status-indicator connected';
+    statusText.textContent = '已连接';
+  };
+
+  state.ws.onclose = () => {
+    if (state.terminated) return; // 撤销/过期：overlay已展示，不再重连
+    statusEl.className = 'status-indicator disconnected';
+    if (!state.initialized) {
+      // 从未收到init：链接本身无效
+      showOverlay('🔒', '链接无效或已过期', '请向文档所有者索取新的分享链接');
+      return;
+    }
+    // 断线重连（若链接已失效，重连会被拒绝并走上面的分支）
+    statusText.textContent = '重连中...';
+    setTimeout(connectWS, 2000);
+  };
+
+  state.ws.onerror = () => {};
+
+  state.ws.onmessage = onMessage;
+}
+
+function onMessage(event) {
+  try {
+    const msg = JSON.parse(event.data);
+
+    switch (msg.type) {
+      case 'init':
+        handleInit(msg);
+        break;
+      case 'op':
+        handleRemoteOp(msg);
+        break;
+      case 'cursor_move':
+        handleCursorMove(msg);
+        break;
+      case 'user_join':
+        handleUserJoin(msg);
+        break;
+      case 'user_leave':
+        handleUserLeave(msg);
+        break;
+      case 'share_revoked':
+        terminate('🚫', '分享已被撤销', '文档所有者撤销了此分享链接');
+        break;
+      case 'share_expired':
+        terminate('⏰', '分享已过期', '此分享链接已超过有效期');
+        break;
+    }
+  } catch (e) {
+    console.error('解析消息失败:', e);
+  }
+}
+
+function handleInit(msg) {
+  state.initialized = true;
+  state.clientId = msg.client_id;
+
+  if (msg.title) docTitle.textContent = msg.title;
+  if (msg.content !== undefined) {
+    state.content = msg.content;
+    editor.value = msg.content;
+  }
+  if (msg.version !== undefined) {
+    state.version = msg.version;
+    versionEl.textContent = msg.version;
+  }
+
+  if (msg.users) {
+    state.users = msg.users.filter(u => u.client_id !== state.clientId);
+    renderUsers();
+  }
+
+  if (msg.cursors) {
+    msg.cursors.forEach(c => {
+      if (c.client_id !== state.clientId) {
+        state.remoteCursors[c.client_id] = { ...c };
+      }
+    });
+    renderCursors();
+  }
+}
+
+function handleRemoteOp(msg) {
+  applyOpToEditor(msg.op);
+  state.version = msg.version;
+  versionEl.textContent = state.version;
+  renderCursors();
+}
+
+function handleCursorMove(msg) {
+  if (msg.client_id === state.clientId) return;
+  state.remoteCursors[msg.client_id] = {
+    client_id: msg.client_id,
+    username: msg.username,
+    position: msg.position,
+    color: msg.color
+  };
+  renderCursors();
+}
+
+function handleUserJoin(msg) {
+  if (msg.client_id === state.clientId) return;
+  if (!state.users.find(u => u.client_id === msg.client_id)) {
+    state.users.push({
+      client_id: msg.client_id,
+      username: msg.username,
+      color: msg.color
+    });
+  }
+  renderUsers();
+}
+
+function handleUserLeave(msg) {
+  state.users = state.users.filter(u => u.client_id !== msg.client_id);
+  delete state.remoteCursors[msg.client_id];
+  renderUsers();
+  renderCursors();
+}
+
+// 链接被撤销/过期：立即终止，展示遮罩
+function terminate(icon, title, desc) {
+  state.terminated = true;
+  if (state.ws) state.ws.close();
+  showOverlay(icon, title, desc);
+}
+
+function showOverlay(icon, title, desc) {
+  document.getElementById('overlayIcon').textContent = icon;
+  document.getElementById('overlayTitle').textContent = title;
+  document.getElementById('overlayDesc').textContent = desc;
+  overlay.classList.add('show');
+  statusEl.className = 'status-indicator disconnected';
+  statusText.textContent = '已断开';
+}
+
+// ========== 用户列表渲染 ==========
+function renderUsers() {
+  usersPanel.innerHTML = state.users.map(u => `
+    <div class="user-chip" style="border-color:${u.color}">
+      <div class="dot" style="background:${u.color}"></div>
+      ${escapeHtml(u.username)}
+    </div>
+  `).join('');
+  userCount.textContent = state.users.length;
+}
+
+// ========== 光标渲染 ==========
+function renderCursors() {
+  cursorsLayer.innerHTML = '';
+
+  Object.values(state.remoteCursors).forEach(cursor => {
+    const pos = cursor.position;
+    if (pos < 0 || pos > editor.value.length) return;
+
+    const posInfo = getCaretCoordinates(editor, pos);
+
+    const el = document.createElement('div');
+    el.className = 'remote-cursor';
+    el.style.background = cursor.color;
+    el.style.top = posInfo.top + 'px';
+    el.style.left = posInfo.left + 'px';
+    el.style.height = posInfo.height + 'px';
+
+    const label = document.createElement('div');
+    label.className = 'remote-cursor-label';
+    label.style.background = cursor.color;
+    label.textContent = cursor.username;
+    el.appendChild(label);
+
+    cursorsLayer.appendChild(el);
+  });
+}
+
+// 获取光标在textarea中的像素位置
+function getCaretCoordinates(element, position) {
+  const mirror = document.createElement('div');
+  const style = window.getComputedStyle(element);
+
+  const props = ['boxSizing', 'width', 'height', 'overflowX', 'overflowY',
+    'borderTopWidth', 'borderRightWidth', 'borderBottomWidth', 'borderLeftWidth',
+    'borderStyle', 'paddingTop', 'paddingRight', 'paddingBottom', 'paddingLeft',
+    'fontStyle', 'fontVariant', 'fontWeight', 'fontStretch', 'fontSize',
+    'fontSizeAdjust', 'lineHeight', 'fontFamily',
+    'textAlign', 'textTransform', 'textIndent', 'textDecoration',
+    'letterSpacing', 'wordSpacing', 'tabSize'];
+
+  props.forEach(p => {
+    mirror.style[p] = style[p];
+  });
+
+  mirror.style.position = 'absolute';
+  mirror.style.top = '0';
+  mirror.style.left = '0';
+  mirror.style.visibility = 'hidden';
+  mirror.style.whiteSpace = 'pre-wrap';
+  mirror.style.wordWrap = 'break-word';
+
+  const text = element.value.substring(0, position);
+  const afterText = element.value.substring(position);
+  mirror.textContent = text;
+
+  const span = document.createElement('span');
+  span.textContent = afterText || '.';
+  mirror.appendChild(span);
+
+  document.body.appendChild(mirror);
+
+  const mirrorRect = mirror.getBoundingClientRect();
+  const spanRect = span.getBoundingClientRect();
+
+  document.body.removeChild(mirror);
+
+  return {
+    top: spanRect.top - mirrorRect.top - element.scrollTop,
+    left: spanRect.left - mirrorRect.left - element.scrollLeft,
+    height: parseInt(style.lineHeight) || parseInt(style.fontSize) * 1.2,
+    width: 2
+  };
+}
+
+// ========== 远端操作应用（只应用，不产生任何上行数据） ==========
+function applyOpToEditor(op) {
+  const operations = op.operations || [op];
+
+  operations.forEach(o => {
+    if (o.type === 'insert') {
+      insertText(o.position, o.text);
+    } else if (o.type === 'delete') {
+      deleteText(o.position, o.length);
+    }
+  });
+
+  state.content = editor.value;
+}
+
+function insertText(pos, text) {
+  const before = editor.value.substring(0, pos);
+  const after = editor.value.substring(pos);
+  editor.value = before + text + after;
+}
+
+function deleteText(pos, length) {
+  const before = editor.value.substring(0, pos);
+  const after = editor.value.substring(pos + length);
+  editor.value = before + after;
+}
+
+function escapeHtml(s) {
+  const div = document.createElement('div');
+  div.textContent = s;
+  return div.innerHTML;
+}
+
+// 启动
+init();
+</script>
+</body>
+</html>

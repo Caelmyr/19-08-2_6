@@ -38,6 +38,15 @@ func NewClient(hub *Hub, conn *websocket.Conn, roomID, username string) *Client 
 	}
 }
 
+// NewViewerClient 创建只读访客连接（通过分享链接进入，不能编辑）
+func NewViewerClient(hub *Hub, conn *websocket.Conn, roomID, username, shareToken string, expiresAt *time.Time) *Client {
+	c := NewClient(hub, conn, roomID, username)
+	c.ReadOnly = true
+	c.ShareToken = shareToken
+	c.ShareExpiresAt = expiresAt
+	return c
+}
+
 // ReadPump 从WebSocket读取消息并发送到hub
 func (c *Client) ReadPump(opHandler func(*Client, Message)) {
 	defer func() {
@@ -126,7 +135,14 @@ func (c *Client) WritePump() {
 }
 
 // SendMessage 发送消息到客户端
-func (c *Client) SendMessage(msg Message) error {
+func (c *Client) SendMessage(msg Message) (err error) {
+	// 连接关闭与消息发送可能并发，Send通道可能已被关闭
+	defer func() {
+		if r := recover(); r != nil {
+			err = ErrSendBufferFull
+		}
+	}()
+
 	data, err := json.Marshal(msg)
 	if err != nil {
 		return err

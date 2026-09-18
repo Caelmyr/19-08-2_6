@@ -48,6 +48,9 @@ func main() {
 
 	server := api.NewServer(db, st, hub)
 
+	// 启动分享链接过期清理协程
+	server.StartShareExpiryJanitor()
+
 	// 创建默认文档
 	if err := ensureDefaultDoc(st); err != nil {
 		log.Printf("Warning: ensure default doc failed: %v", err)
@@ -79,6 +82,22 @@ func main() {
 		case path == "":
 			server.ListDocuments(w, r)
 			return
+		case hasSuffix(path, "/share"):
+			docID := path[:len(path)-len("/share")]
+			if r.Method == "POST" {
+				server.CreateShareLink(w, r, docID)
+			} else {
+				http.Error(w, "method not allowed", 405)
+			}
+			return
+		case hasSuffix(path, "/shares"):
+			docID := path[:len(path)-len("/shares")]
+			if r.Method == "GET" {
+				server.ListShareLinks(w, r, docID)
+			} else {
+				http.Error(w, "method not allowed", 405)
+			}
+			return
 		case hasSuffix(path, "/snapshot"):
 			docID := path[:len(path)-len("/snapshot")]
 			server.GetDocumentSnapshotByID(w, r, docID)
@@ -105,6 +124,25 @@ func main() {
 				http.Error(w, "method not allowed", 405)
 			}
 		}
+	})
+
+	// 撤销分享链接: DELETE /api/share/{token}
+	mux.HandleFunc("/api/share/", func(w http.ResponseWriter, r *http.Request) {
+		token := r.URL.Path[len("/api/share/"):]
+		if token == "" {
+			http.Error(w, "missing token", 400)
+			return
+		}
+		if r.Method != "DELETE" {
+			http.Error(w, "method not allowed", 405)
+			return
+		}
+		server.RevokeShareLink(w, r, token)
+	})
+
+	// 只读分享页面: /share/{token}
+	mux.HandleFunc("/share/", func(w http.ResponseWriter, r *http.Request) {
+		http.ServeFile(w, r, "web/static/view.html")
 	})
 
 	// WebSocket路由

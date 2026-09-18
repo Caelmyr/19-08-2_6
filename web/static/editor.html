@@ -151,6 +151,103 @@
     align-items: center;
     gap: 6px;
   }
+
+  .share-btn {
+    padding: 6px 14px;
+    border: none;
+    border-radius: 8px;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    background: #4361ee;
+    color: white;
+  }
+  .share-btn:hover { background: #3a56d4; }
+
+  /* 分享弹窗 */
+  .modal-mask {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(26, 26, 46, 0.5);
+    z-index: 100;
+    align-items: center;
+    justify-content: center;
+  }
+  .modal-mask.show { display: flex; }
+  .modal {
+    background: white;
+    border-radius: 12px;
+    padding: 24px;
+    width: 520px;
+    max-width: 92vw;
+    max-height: 80vh;
+    overflow-y: auto;
+  }
+  .modal h2 { font-size: 18px; color: #1a1a2e; margin-bottom: 4px; }
+  .modal .tip { font-size: 13px; color: #999; margin-bottom: 16px; }
+  .share-create-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 16px;
+  }
+  .share-create-row select {
+    padding: 8px 10px;
+    border: 2px solid #e8ecf1;
+    border-radius: 8px;
+    font-size: 13px;
+  }
+  .share-create-row button {
+    padding: 8px 16px;
+    border: none;
+    border-radius: 8px;
+    background: #4361ee;
+    color: white;
+    font-size: 13px;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .share-item {
+    border: 1px solid #e8ecf1;
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 8px;
+    font-size: 13px;
+  }
+  .share-item .link-row {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+  .share-item .url {
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: #4361ee;
+    font-family: monospace;
+    font-size: 12px;
+  }
+  .share-item .meta { color: #999; font-size: 12px; margin-top: 6px; }
+  .share-item.invalid .url { color: #bbb; text-decoration: line-through; }
+  .mini-btn {
+    padding: 4px 10px;
+    border: none;
+    border-radius: 6px;
+    font-size: 12px;
+    cursor: pointer;
+    background: #e8ecf1;
+    color: #333;
+  }
+  .mini-btn.danger { background: #e74c3c; color: white; }
+  .modal-close {
+    float: right;
+    border: none;
+    background: none;
+    font-size: 18px;
+    cursor: pointer;
+    color: #999;
+  }
 </style>
 </head>
 <body>
@@ -161,9 +258,28 @@
     <div class="doc-title" id="docTitle">加载中...</div>
   </div>
   <div class="toolbar-right">
+    <button class="share-btn" onclick="openShareModal()">🔗 分享</button>
     <div class="version-badge">v<span id="version">0</span></div>
     <div class="status-indicator" id="status"></div>
     <span id="statusText">连接中...</span>
+  </div>
+</div>
+
+<div class="modal-mask" id="shareModal">
+  <div class="modal">
+    <button class="modal-close" onclick="closeShareModal()">✕</button>
+    <h2>只读分享</h2>
+    <p class="tip">访客通过链接实时查看文档和协作者光标，但不能编辑。链接可随时撤销或设置有效期。</p>
+    <div class="share-create-row">
+      <select id="expirySelect">
+        <option value="0">永不过期</option>
+        <option value="3600">1 小时有效</option>
+        <option value="86400">1 天有效</option>
+        <option value="604800">7 天有效</option>
+      </select>
+      <button onclick="createShare()">生成只读链接</button>
+    </div>
+    <div id="shareList"></div>
   </div>
 </div>
 
@@ -649,6 +765,85 @@ function escapeHtml(s) {
   const div = document.createElement('div');
   div.textContent = s;
   return div.innerHTML;
+}
+
+// ========== 只读分享 ==========
+const shareModal = document.getElementById('shareModal');
+
+function openShareModal() {
+  shareModal.classList.add('show');
+  loadShares();
+}
+
+function closeShareModal() {
+  shareModal.classList.remove('show');
+}
+
+async function createShare() {
+  const expiresIn = parseInt(document.getElementById('expirySelect').value, 10);
+  const res = await fetch(`/api/documents/${docId}/share`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ expires_in_seconds: expiresIn })
+  });
+  if (!res.ok) {
+    alert('创建分享链接失败');
+    return;
+  }
+  const data = await res.json();
+  const fullUrl = location.origin + data.share_url;
+  try {
+    await navigator.clipboard.writeText(fullUrl);
+    alert('链接已创建并复制到剪贴板：\n' + fullUrl);
+  } catch (e) {
+    prompt('链接已创建，请手动复制：', fullUrl);
+  }
+  loadShares();
+}
+
+async function loadShares() {
+  const res = await fetch(`/api/documents/${docId}/shares`);
+  const links = await res.json();
+  const list = document.getElementById('shareList');
+
+  if (!links || links.length === 0) {
+    list.innerHTML = '<p style="color:#999;font-size:13px;">还没有分享链接</p>';
+    return;
+  }
+
+  list.innerHTML = links.map(l => {
+    const valid = !l.revoked && (!l.expires_at || new Date(l.expires_at) > new Date());
+    const url = location.origin + '/share/' + l.token;
+    const expiry = l.expires_at
+      ? '有效期至 ' + new Date(l.expires_at).toLocaleString('zh-CN')
+      : '永不过期';
+    const status = l.revoked ? '已撤销' : (valid ? '有效' : '已过期');
+    return `
+      <div class="share-item ${valid ? '' : 'invalid'}">
+        <div class="link-row">
+          <span class="url">${url}</span>
+          ${valid ? `<button class="mini-btn" onclick="copyShareUrl('${l.token}')">复制</button>` : ''}
+          ${valid ? `<button class="mini-btn danger" onclick="revokeShare('${l.token}')">撤销</button>` : ''}
+        </div>
+        <div class="meta">${expiry} · ${status} · 创建于 ${new Date(l.created_at).toLocaleString('zh-CN')}</div>
+      </div>`;
+  }).join('');
+}
+
+async function copyShareUrl(token) {
+  const url = location.origin + '/share/' + token;
+  try {
+    await navigator.clipboard.writeText(url);
+    alert('已复制：' + url);
+  } catch (e) {
+    prompt('请手动复制：', url);
+  }
+}
+
+async function revokeShare(token) {
+  if (!confirm('撤销后，正在通过该链接查看的访客将立即失去访问。确定撤销？')) return;
+  await fetch(`/api/share/${token}`, { method: 'DELETE' });
+  loadShares();
 }
 
 // 启动
